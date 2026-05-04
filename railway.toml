@@ -1,0 +1,5 @@
+[build]
+nixpacksVersion = "1"
+
+[build.nixpacksPlan.phases.setup]
+nixPkgs = ["nodejs_20"]
