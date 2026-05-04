@@ -16,8 +16,8 @@
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.18",
     "axios": "^1.16.0",
-    "express": "^5.2.1",
-    "pino": "^10.3.1",
+    "express": "^4.22.1",
+    "pino": "^8.21.0",
     "qrcode": "^1.5.4"
   }
 }

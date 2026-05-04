@@ -30,15 +30,13 @@ async function startSession(agentId) {
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
 
-  const logger = pino({ level: 'silent' })
-
-  const sock = makeWASocket({
+    const sock = makeWASocket({
     auth: state,
     printQRInTerminal: true,
-    logger,
+    logger: pino({ level: 'silent' }),
     browser: ['ChatFlow', 'Safari', '604.1'],
-    connectTimeoutMs: 30000,
-    defaultQueryTimeoutMs: 30000,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
     keepAliveIntervalMs: 15000,
   })
 
