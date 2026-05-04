@@ -57,7 +57,6 @@ async function startSession(agentId, phoneNumber) {
 
   sock.ev.on('creds.update', saveCreds)
 
-  // Générer le pairing code dès que le socket est prêt
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update
     const session = sessions.get(agentId)
@@ -90,20 +89,25 @@ async function startSession(agentId, phoneNumber) {
         setTimeout(() => startSession(agentId, phoneNumber), 8000)
       }
     }
+  })
 
-    // Générer le pairing code quand le socket est en attente d'auth
-    if (!sock.authState.creds.registered && phoneNumber && !session.pairingCode && connection !== 'open') {
+  // Demander le pairing code après 2s (quand le socket est initialisé)
+  if (phoneNumber && !sock.authState.creds.registered) {
+    setTimeout(async () => {
+      const session = sessions.get(agentId)
+      if (!session || session.pairingCode || session.status === 'CONNECTED') return
       try {
         const clean = phoneNumber.replace(/\D/g, '')
+        console.log(`[${agentId}] Demande pairing code pour ${clean}`)
         const code = await sock.requestPairingCode(clean)
         session.pairingCode = code
         session.status = 'PAIRING'
-        console.log(`[${agentId}] Pairing code généré: ${code}`)
+        console.log(`[${agentId}] Pairing code: ${code}`)
       } catch (e) {
         console.error(`[${agentId}] Erreur pairing code:`, e.message)
       }
-    }
-  })
+    }, 3000)
+  }
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return
