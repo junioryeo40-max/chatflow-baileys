@@ -1,5 +1,5 @@
 const express = require('express')
-const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const axios = require('axios')
 const fs = require('fs')
@@ -19,36 +19,55 @@ function auth(req, res, next) {
 }
 
 async function startSession(agentId) {
+  // Nettoyer l'ancienne session si elle existe
+  if (sessions.has(agentId)) {
+    try { sessions.get(agentId).socket?.end() } catch {}
+    sessions.delete(agentId)
+  }
+
   const sessionDir = path.join('./sessions', agentId)
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
 
+  const logger = pino({ level: 'silent' })
+
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: 'silent' }),
-    browser: ['ChatFlow', 'Chrome', '1.0.0'],
+    printQRInTerminal: true,
+    logger,
+    browser: ['ChatFlow', 'Safari', '604.1'],
+    connectTimeoutMs: 30000,
+    defaultQueryTimeoutMs: 30000,
+    keepAliveIntervalMs: 15000,
   })
 
   sessions.set(agentId, { socket: sock, qr: null, status: 'CONNECTING', phoneNumber: null })
 
   sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
     const session = sessions.get(agentId)
     if (!session) return
 
+    console.log(`[${agentId}] connection.update:`, { connection, hasQR: !!qr })
+
     if (qr) {
-      session.qr = await QRCode.toDataURL(qr, { width: 300, margin: 2 })
-      session.status = 'QR_PENDING'
+      try {
+        session.qr = await QRCode.toDataURL(qr, { width: 300, margin: 2 })
+        session.status = 'QR_PENDING'
+        console.log(`[${agentId}] QR généré`)
+      } catch (e) {
+        console.error(`[${agentId}] Erreur QR:`, e.message)
+      }
     }
 
     if (connection === 'open') {
       session.status = 'CONNECTED'
       session.qr = null
       session.phoneNumber = sock.user?.id?.split(':')[0] || null
-      console.log(`Agent ${agentId} connecté — ${session.phoneNumber}`)
+      console.log(`[${agentId}] Connecté — ${session.phoneNumber}`)
 
       if (CHATFLOW_URL) {
         axios.post(`${CHATFLOW_URL}/api/whatsapp/webhook`, {
@@ -61,7 +80,7 @@ async function startSession(agentId) {
       const code = lastDisconnect?.error?.output?.statusCode
       const reconnect = code !== DisconnectReason.loggedOut
       session.status = reconnect ? 'RECONNECTING' : 'DISCONNECTED'
-      console.log(`Agent ${agentId} déconnecté — reconnect: ${reconnect}`)
+      console.log(`[${agentId}] Fermé — code: ${code}, reconnect: ${reconnect}`)
 
       if (reconnect) {
         setTimeout(() => startSession(agentId), 5000)
@@ -76,63 +95,57 @@ async function startSession(agentId) {
 
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue
-
       const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '')
-      if (!phone || phone.includes('g.us')) continue // ignorer les groupes
+      if (!phone || phone.includes('g.us')) continue
 
       const text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        ''
+        msg.message?.imageMessage?.caption || ''
 
       if (!text.trim()) continue
-
-      console.log(`Message reçu — agent: ${agentId} | de: ${phone} | texte: ${text}`)
+      console.log(`[${agentId}] Message de ${phone}: ${text}`)
 
       if (!CHATFLOW_URL) continue
 
       try {
         const res = await axios.post(`${CHATFLOW_URL}/api/whatsapp/webhook`, {
           event: 'message', agentId, phone, message: text
-        }, { headers: { 'x-secret': SECRET } })
+        }, { headers: { 'x-secret': SECRET }, timeout: 15000 })
 
         const reply = res.data?.response
         if (reply) {
           await sock.sendMessage(`${phone}@s.whatsapp.net`, { text: reply })
         }
       } catch (err) {
-        console.error(`Erreur traitement message: ${err.message}`)
+        console.error(`[${agentId}] Erreur message:`, err.message)
       }
     }
   })
+
+  return sock
 }
 
-// Routes
 app.get('/health', (req, res) => res.json({ status: 'ok', sessions: sessions.size }))
 
 app.post('/session/start', auth, async (req, res) => {
   const { agentId } = req.body
   if (!agentId) return res.status(400).json({ error: 'agentId requis' })
 
-  if (!sessions.has(agentId)) {
-    await startSession(agentId)
+  const existing = sessions.get(agentId)
+  if (existing && existing.status === 'CONNECTED') {
+    return res.json({ success: true, status: 'CONNECTED' })
   }
 
-  res.json({ success: true, status: sessions.get(agentId)?.status })
+  await startSession(agentId)
+  res.json({ success: true, status: 'CONNECTING' })
 })
 
-app.get('/session/:agentId/qr', auth, async (req, res) => {
+app.get('/session/:agentId/qr', auth, (req, res) => {
   const { agentId } = req.params
-
-  if (!sessions.has(agentId)) {
-    await startSession(agentId)
-    await new Promise(r => setTimeout(r, 4000))
-  }
-
   const session = sessions.get(agentId)
-  if (!session) return res.status(404).json({ error: 'Session introuvable' })
 
+  if (!session) return res.json({ qr: null, status: 'DISCONNECTED' })
   res.json({ qr: session.qr, status: session.status })
 })
 
