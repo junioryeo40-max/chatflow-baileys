@@ -18,7 +18,7 @@ function auth(req, res, next) {
   next()
 }
 
-async function startSession(agentId) {
+async function startSession(agentId, fresh = false) {
   // Nettoyer l'ancienne session si elle existe
   if (sessions.has(agentId)) {
     try { sessions.get(agentId).socket?.end() } catch {}
@@ -26,6 +26,13 @@ async function startSession(agentId) {
   }
 
   const sessionDir = path.join('./sessions', agentId)
+
+  // Si fresh=true ou si on vient d'un 405, supprimer les fichiers corrompus
+  if (fresh && fs.existsSync(sessionDir)) {
+    fs.rmSync(sessionDir, { recursive: true })
+    console.log(`[${agentId}] Session supprimée — redémarrage propre`)
+  }
+
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
@@ -76,14 +83,19 @@ async function startSession(agentId) {
 
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode
-      const reconnect = code !== DisconnectReason.loggedOut
-      session.status = reconnect ? 'RECONNECTING' : 'DISCONNECTED'
-      console.log(`[${agentId}] Fermé — code: ${code}, reconnect: ${reconnect}`)
+      console.log(`[${agentId}] Fermé — code: ${code}`)
 
-      if (reconnect) {
-        setTimeout(() => startSession(agentId), 5000)
-      } else {
+      if (code === DisconnectReason.loggedOut) {
+        session.status = 'DISCONNECTED'
         sessions.delete(agentId)
+      } else if (code === 405) {
+        // Session corrompue — redémarrer proprement
+        console.log(`[${agentId}] Session corrompue (405) — redémarrage propre dans 5s`)
+        session.status = 'RECONNECTING'
+        setTimeout(() => startSession(agentId, true), 5000)
+      } else {
+        session.status = 'RECONNECTING'
+        setTimeout(() => startSession(agentId), 5000)
       }
     }
   })
@@ -135,7 +147,8 @@ app.post('/session/start', auth, async (req, res) => {
     return res.json({ success: true, status: 'CONNECTED' })
   }
 
-  await startSession(agentId)
+  // Toujours démarrer proprement (fresh) depuis le dashboard
+  await startSession(agentId, true)
   res.json({ success: true, status: 'CONNECTING' })
 })
 
