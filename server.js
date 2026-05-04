@@ -1,6 +1,5 @@
 const express = require('express')
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
-const QRCode = require('qrcode')
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
 const axios = require('axios')
 const fs = require('fs')
 const path = require('path')
@@ -12,65 +11,63 @@ app.use(express.json())
 const sessions = new Map()
 const CHATFLOW_URL = process.env.CHATFLOW_URL || ''
 const SECRET = process.env.BAILEYS_SECRET || 'chatflow-secret'
+const logger = pino({ level: 'silent' })
 
 function auth(req, res, next) {
   if (req.headers['x-secret'] !== SECRET) return res.status(401).json({ error: 'Non autorisé' })
   next()
 }
 
-async function startSession(agentId, fresh = false) {
-  // Nettoyer l'ancienne session si elle existe
+function clearSession(agentId) {
+  if (sessions.has(agentId)) {
+    try { sessions.get(agentId).socket?.end() } catch {}
+    sessions.delete(agentId)
+  }
+  const sessionDir = path.join('./sessions', agentId)
+  if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true })
+}
+
+async function startSession(agentId, phoneNumber) {
   if (sessions.has(agentId)) {
     try { sessions.get(agentId).socket?.end() } catch {}
     sessions.delete(agentId)
   }
 
   const sessionDir = path.join('./sessions', agentId)
-
-  // Si fresh=true ou si on vient d'un 405, supprimer les fichiers corrompus
-  if (fresh && fs.existsSync(sessionDir)) {
-    fs.rmSync(sessionDir, { recursive: true })
-    console.log(`[${agentId}] Session supprimée — redémarrage propre`)
-  }
-
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
 
-    const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true,
-    logger: pino({ level: 'silent' }),
-    browser: ['ChatFlow', 'Safari', '604.1'],
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 15000,
+  const sock = makeWASocket({
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger)
+    },
+    logger,
+    printQRInTerminal: false,
+    browser: ['Ubuntu', 'Chrome', '22.04.4'],
   })
 
-  sessions.set(agentId, { socket: sock, qr: null, status: 'CONNECTING', phoneNumber: null })
+  sessions.set(agentId, {
+    socket: sock,
+    pairingCode: null,
+    status: 'CONNECTING',
+    phoneNumber: null
+  })
 
   sock.ev.on('creds.update', saveCreds)
 
+  // Générer le pairing code dès que le socket est prêt
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
+    const { connection, lastDisconnect } = update
     const session = sessions.get(agentId)
     if (!session) return
 
-    console.log(`[${agentId}] connection.update:`, { connection, hasQR: !!qr })
-
-    if (qr) {
-      try {
-        session.qr = await QRCode.toDataURL(qr, { width: 300, margin: 2 })
-        session.status = 'QR_PENDING'
-        console.log(`[${agentId}] QR généré`)
-      } catch (e) {
-        console.error(`[${agentId}] Erreur QR:`, e.message)
-      }
-    }
+    console.log(`[${agentId}] connection.update: ${connection}`)
 
     if (connection === 'open') {
       session.status = 'CONNECTED'
-      session.qr = null
+      session.pairingCode = null
       session.phoneNumber = sock.user?.id?.split(':')[0] || null
       console.log(`[${agentId}] Connecté — ${session.phoneNumber}`)
 
@@ -88,14 +85,22 @@ async function startSession(agentId, fresh = false) {
       if (code === DisconnectReason.loggedOut) {
         session.status = 'DISCONNECTED'
         sessions.delete(agentId)
-      } else if (code === 405) {
-        // Session corrompue — redémarrer proprement
-        console.log(`[${agentId}] Session corrompue (405) — redémarrage propre dans 5s`)
-        session.status = 'RECONNECTING'
-        setTimeout(() => startSession(agentId, true), 5000)
       } else {
         session.status = 'RECONNECTING'
-        setTimeout(() => startSession(agentId), 5000)
+        setTimeout(() => startSession(agentId, phoneNumber), 8000)
+      }
+    }
+
+    // Générer le pairing code quand le socket est en attente d'auth
+    if (!sock.authState.creds.registered && phoneNumber && !session.pairingCode && connection !== 'open') {
+      try {
+        const clean = phoneNumber.replace(/\D/g, '')
+        const code = await sock.requestPairingCode(clean)
+        session.pairingCode = code
+        session.status = 'PAIRING'
+        console.log(`[${agentId}] Pairing code généré: ${code}`)
+      } catch (e) {
+        console.error(`[${agentId}] Erreur pairing code:`, e.message)
       }
     }
   })
@@ -128,36 +133,37 @@ async function startSession(agentId, fresh = false) {
           await sock.sendMessage(`${phone}@s.whatsapp.net`, { text: reply })
         }
       } catch (err) {
-        console.error(`[${agentId}] Erreur message:`, err.message)
+        console.error(`[${agentId}] Erreur:`, err.message)
       }
     }
   })
-
-  return sock
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok', sessions: sessions.size }))
 
+// Démarrer session avec numéro de téléphone → génère pairing code
 app.post('/session/start', auth, async (req, res) => {
-  const { agentId } = req.body
-  if (!agentId) return res.status(400).json({ error: 'agentId requis' })
+  const { agentId, phoneNumber } = req.body
+  if (!agentId || !phoneNumber) return res.status(400).json({ error: 'agentId et phoneNumber requis' })
 
-  const existing = sessions.get(agentId)
-  if (existing && existing.status === 'CONNECTED') {
-    return res.json({ success: true, status: 'CONNECTED' })
+  clearSession(agentId)
+  await startSession(agentId, phoneNumber)
+
+  // Attendre que le pairing code soit généré (max 15s)
+  let attempts = 0
+  while (attempts < 15) {
+    await new Promise(r => setTimeout(r, 1000))
+    const session = sessions.get(agentId)
+    if (session?.pairingCode) {
+      return res.json({ success: true, pairingCode: session.pairingCode, status: 'PAIRING' })
+    }
+    if (session?.status === 'CONNECTED') {
+      return res.json({ success: true, pairingCode: null, status: 'CONNECTED' })
+    }
+    attempts++
   }
 
-  // Toujours démarrer proprement (fresh) depuis le dashboard
-  await startSession(agentId, true)
-  res.json({ success: true, status: 'CONNECTING' })
-})
-
-app.get('/session/:agentId/qr', auth, (req, res) => {
-  const { agentId } = req.params
-  const session = sessions.get(agentId)
-
-  if (!session) return res.json({ qr: null, status: 'DISCONNECTED' })
-  res.json({ qr: session.qr, status: session.status })
+  res.json({ success: true, pairingCode: null, status: 'CONNECTING' })
 })
 
 app.get('/session/:agentId/status', auth, (req, res) => {
@@ -165,19 +171,14 @@ app.get('/session/:agentId/status', auth, (req, res) => {
   const session = sessions.get(agentId)
   res.json({
     status: session?.status ?? 'DISCONNECTED',
-    phoneNumber: session?.phoneNumber ?? null
+    phoneNumber: session?.phoneNumber ?? null,
+    pairingCode: session?.pairingCode ?? null
   })
 })
 
 app.post('/session/:agentId/disconnect', auth, async (req, res) => {
   const { agentId } = req.params
-  const session = sessions.get(agentId)
-  if (session?.socket) {
-    await session.socket.logout().catch(() => {})
-    sessions.delete(agentId)
-  }
-  const sessionDir = path.join('./sessions', agentId)
-  if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true })
+  clearSession(agentId)
   res.json({ success: true })
 })
 
